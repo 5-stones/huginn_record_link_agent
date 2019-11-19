@@ -1,9 +1,13 @@
 {
-  "name": "huginn_http_request_agent",
+  "name": "huginn_record_link_agent",
   "version": "1.0.0",
-  "description": "Huginn agent for HTTP requests",
+  "description": "Huginn agent for creating bidirectional link between records across external systems",
   "scripts": {
-    "version": "npm run changelog && git add CHANGELOG.md",
+    "version": "npm run changelog && git add CHANGELOG.md && npm run version:gemspec",
+    "version:gemspec": "node version.js && git add huginn_record_link_agent.gemspec",
+    "gem:build": "gem build huginn_record_link_agent.gemspec",
+    "gem:push": "node push.js",
+    "gem:release": "npm run gem:build && npm run gem:push",
     "postversion": "git push && git push --tags",
     "changelog": "conventional-changelog -p angular -i CHANGELOG.md -s -r 0"
   },

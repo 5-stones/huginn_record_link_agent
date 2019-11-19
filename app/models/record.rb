@@ -1,15 +1,14 @@
-class HuginnRecordLinkAgent::ExternalRecordRef < ActiveRecord::Base
+class HuginnRecordLinkAgent::Record < ActiveRecord::Base
 
-  self.table_name= "hrla_record_references"
+  self.table_name = "hrla_records"
 
   # AVAILABLE FIELDS
-  # user_id
   # system
   # model_type
-  # uid (external id)
+  # external_id (external id)
 
-  validates_presence_of :user_id, :ext_system, :model_type, :uid
-  validates :user_id, uniqueness: {scope: [:ext_system, :model_type, :uid]}
+  validates_presence_of :user_id, :ext_system, :model_type, :external_id
+  validates :user_id, uniqueness: {scope: [:ext_system, :model_type, :external_id]}
 
   has_one :user
 
