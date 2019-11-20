@@ -1,12 +1,5 @@
 module Agents
   class RecordLinkAgent < Agent
-    include EventHeadersConcern
-    include WebRequestConcern
-    include FileHandling
-
-    consumes_file_pointer!
-
-    MIME_RE = /\A\w+\/.+\z/
 
     can_dry_run!
     no_bulk_receive!
@@ -18,13 +11,16 @@ module Agents
 
         ## Agent Options
 
-          - `create_link` - When `true`, this agent will create a link between a source and target record.
+          - `create_link` - When `true`, this agent will create a link between a source and target record. When false, this agent will simple look for matching record links.
           - `lookup_type` - One of `source`, `target`, `both`. Determines which link type to retrieve
           - `emit_each` - When `true`, each linked record will be emitted as a single event
           - `emit_events` - Setting this to `true` will result in the generated RecordLink being emitted as an Event which can be subsequently consumed by another agent
           - `output_mode` - Setting this value to `merge` will result in the emitted Event being merged into the original contents of the received Event. Setting it to `clean` will result in no merge.
 
         ###Create Record Link
+        Link creation leverages Rails `find_or_create_by` to avoid errors. This allows users to inject a link creation into their existing
+        flow without requiring trigger agents that check to see whether a link already exists. In most implementations, this check will have
+        run earlier in the flow (prior to upserting records to the external system)
 
         **Required Options:**
           - `source_system` - The source/authority for the record in question
@@ -46,7 +42,7 @@ module Agents
         **Optional Filters:**
           - `target_system` - Only return matches from the specified system
           - `target_type` - Only return matches of the specified type (**Note:** When set, `target_system` is required)
-          - `create_link` - Set to `false`
+          - `create_link` - Set to `false`. This value defaults to `false` if not provided
 
         ###Find Source Record Links
 
@@ -59,7 +55,7 @@ module Agents
         **Optional Filters
           - `source_system` - Only return matches from the specified system
           - `source_type` - Only return matches of the specified type (**Note:** When set, `target_system` is required)
-          - `create_link` - Set to `false`
+          - `create_link` - Set to `false`. This value defaults to `false` if not provided
 
         ###Find All Record Links
 
@@ -68,7 +64,7 @@ module Agents
           - `record_system` - The system containing the record
           - `record_type` - The record type in the specified system
           - `record_id` - The ID of the record
-          - `create_link` - Set to `false`
+          - `create_link` - Set to `false`. This value defaults to `false` if not provided
 
         **Optional Filters:**
 
@@ -335,48 +331,17 @@ module Agents
       target_id = data['target_id']
 
       log("Creating RecordLink from #{source_system} #{source_type} #{source_id} to #{target_system} #{target_type} #{target_id}")
-      base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {} if boolify(options['emit_events'])
 
       begin
         record_link = create_link(source_system, source_type, source_id, target_system, target_type, target_id)
+
+        payload = create_record_link_payload(source_system, source_type, source_id, target_system, target_type, target_id)
+        emit(data, event, payload) if boolify(options['emit_events'])
+
       rescue => e
-
-        if boolify(options['emit_events'])
-          payload = base_event.merge({
-            record_link: {
-              link_status: "500",
-              link_errors: [
-                {
-                  message: "Failed to create RecordLink: #{e.message}",
-                  source_system: source_system,
-                  source_type: source_type,
-                  source_id: source_id,
-                  target_system: target_system,
-                  target_type: target_type,
-                  target_id: target_id,
-                  trace: e.backtrace.join("\n"),
-                  error: e
-                }
-              ]
-            }
-          })
-        end
-      end
-
-      if boolify(options['emit_events'])
-        payload = base_event.merge({
-          record_link: {
-            link_status: "200",
-            source_system: source_system,
-            source_type: source_type,
-            source_id: source_id,
-            target_system: target_system,
-            target_type: target_type,
-            target_id: target_id
-          }
-        })
-
-        create_event payload: payload
+        link_error = create_link_error(source_system, source_type, source_id, target_system, target_type, target_id, "Failed to create RecordLink: #{e.message}")
+        payload = create_error_payload(500, link_error)
+        emit(data, event, payload) if boolify(options['emit_events'])
       end
     end
 
@@ -393,53 +358,18 @@ module Agents
       record = get_record_reference(target_system, target_type, target_id)
 
       if (record.nil?)
-        base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {} if boolify(options['emit_events'])
-
-        payload = base_event.merge({
-          record_link: {
-            link_status: "500",
-            link_errors: [
-              {
-                message: "Unable to locate lookup record",
-                target_system: target_system,
-                target_type: target_type,
-                target_id: target_id,
-                source_system: source_system,
-                source_type: source_type
-              }
-            ]
-          }
-        })
-
-        create_event(payload: payload) if boolify(options['emit_events'])
+        lookup_error = create_lookup_error(target_system, target_type, target_id, source_system, source_type, "Unable to locate lookup record")
+        payload = create_error_payload(500, lookup_error)
+        emit(data, event, payload) if boolify(options['emit_events'])
       else
-        source_records = record.source_records
-
-        source_records = source_records.where(ext_system: source_system) unless source_system.blank?
-        source_records = source_records.where(model_type: source_type) unless source_type.blank?
+        source_records = filter_links(record.source_records, source_system, source_type)
 
         if source_records.any?
           build_events(event, data, record, source_records) if boolify(options['emit_events'])
         else
-          base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {} if boolify(options['emit_events'])
-
-          payload = base_event.merge({
-            record_link: {
-              link_status: "404",
-              link_errors: [
-                {
-                  message: "No match",
-                  target_system: target_system,
-                  target_type: target_type,
-                  target_id: target_id,
-                  source_system: source_system,
-                  source_type: source_type
-                }
-              ]
-            }
-          })
-
-          create_event(payload: payload) if boolify(options['emit_events'])
+          lookup_error = create_lookup_error(target_system, target_type, target_id, souce_system, source_type, "No matching sources found")
+          payload = create_error_payload(404, lookup_error)
+          emmit(data, event, payload) if boolify(options['emit_events'])
         end
       end
     end
@@ -457,53 +387,18 @@ module Agents
       record = get_record_reference(source_system, source_type, source_id)
 
       if (record.nil?)
-        base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {} if boolify(options['emit_events'])
-
-        payload = base_event.merge({
-          record_link: {
-            link_status: "500",
-            link_errors: [
-              {
-                message: "Unable to locate lookup record",
-                source_system: source_system,
-                source_type: source_type,
-                source_id: source_id,
-                target_system: target_system,
-                target_type: target_type
-              }
-            ]
-          }
-        })
-
-        create_event(payload: payload) if boolify(options['emit_events'])
+        lookup_error = create_lookup_error(source_system, source_type, source_id, target_system, target_type, "Unable to locate lookup record")
+        payload = create_error_payload(500, lookup_error)
+        emit(data, event, payload) if boolify(options['emit_events'])
       else
-        target_records = record.target_records
-
-        target_records = target_records.where(ext_system: target_system) unless target_system.blank?
-        target_records = target_records.where(model_type: target_type) unless target_type.blank?
+        target_records = filter_links(record.target_records, target_system, target_type)
 
         if target_records.any?
           build_events(event, data, record, nil, target_records) if boolify(options['emit_events'])
         else
-          base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {} if boolify(options['emit_events'])
-
-          payload = base_event.merge({
-            record_link: {
-              link_status: "404",
-              link_errors: [
-                {
-                  message: "No match",
-                  source_system: source_system,
-                  source_type: source_type,
-                  source_id: source_id,
-                  target_system: target_system,
-                  target_type: target_type,
-                }
-              ]
-            }
-          })
-
-          create_event(payload: payload) if boolify(options['emit_events'])
+          lookup_error = create_lookup_error(source_system, source_type, source_id, target_system, target_type, "No matching targets found")
+          payload = create_error_payload(404, lookup_error)
+          emit(data, event, payload) if boolify(options['emit_events'])
         end
       end
     end
@@ -521,76 +416,39 @@ module Agents
       record = get_record_reference(record_system, record_type, record_id)
 
       if (record.nil?)
-        base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {} if boolify(options['emit_events'])
-
-        payload = base_event.merge({
-          record_link: {
-            link_status: "500",
-            link_errors: [
-              {
-                message: "Unable to locate lookup record",
-                system: record_system,
-                type: record_type,
-                record_id: record_id,
-                filter_system: filter_system,
-                filter_type: filter_type
-              }
-            ]
-          }
-        })
-
-        create_event(payload: payload) if boolify(options['emit_events'])
+        lookup_error = create_lookup_error(record_system, record_type, record_id, filter_system, filter_type, "Unable to find lookup record")
+        payload = create_error_payload(500, lookup_error)
+        emit(data, event, payload) if boolify(options['emit_events'])
       else
-        source_records = record.source_records
-        source_records = source_records.where(ext_system: filter_system) unless filter_system.blank?
-        source_records = source_records.where(model_type: filter_type) unless filter_type.blank?
-
-        target_records = record.target_records
-        target_records = target_records.where(ext_system: filter_system) unless filter_system.blank?
-        target_records = target_records.where(model_type: filter_type) unless filter_type.blank?
+        source_records = filter_links(record.source_records, filter_system, filter_type)
+        target_records = filter_links(record.target_records, filter_system, filter_type)
 
         if source_records.any? || target_records.any?
           build_events(event, data, record, source_records, target_records) if boolify(options['emit_events'])
         else
-          base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {} if boolify(options['emit_events'])
-
-          payload = base_event.merge({
-            record_link: {
-              link_status: "404",
-              link_errors: [
-                {
-                  message: "No match",
-                  system: record_system,
-                  type: record_type,
-                  record_id: record_id,
-                  filter_system: filter_system,
-                  filter_type: filter_type
-                }
-              ]
-            }
-          })
-
-          create_event(payload: payload) if boolify(options['emit_events'])
+          lookup_error = create_lookup_error(record_system, record_type, record_id, filter_system, filter_type, "No matching links found")
+          payload = create_error_payload(404, lookup_error)
+          emit(data, event_payload) if boolify(options['emit_events'])
         end
       end
     end
 
     def get_record_reference(system, type, id)
-      return HuginnRecordLinkAgent::ExternalRecordRef.find_or_create_by(user_id: self.user.id, ext_system: system, model_type: type, uid: id)
+      return HuginnRecordLinkAgent::Record.find_or_create_by(user_id: self.user.id, ext_system: system, model_type: type, external_id: id)
     end
 
     def build_events(event, data, lookup_record, source_records = nil, target_records = nil)
       sources = []
       if (source_records.present?)
         source_records.each do |s|
-          sources << { system: s.ext_system, type: s.model_type, uid: s.uid }
+          sources << { system: s.ext_system, type: s.model_type, external_id: s.external_id }
         end
       end
 
       targets = []
       if (target_records.present?)
         target_records.each do |t|
-          targets << { system: t.ext_system, type: t.model_type, uid: t.uid }
+          targets << { system: t.ext_system, type: t.model_type, external_id: t.external_id }
         end
       end
 
@@ -600,50 +458,44 @@ module Agents
         # Emit each event individually
 
         sources.each do |s|
-          payload = base_event.merge({
-            record_link: {
-              link_status: "200",
-              source_system: s[:system],
-              source_type: s[:type],
-              source_id: s[:uid],
-              target_system: lookup_record.ext_system,
-              target_type: lookup_record.model_type,
-              target_id: lookup_record.uid
-            }
-          })
 
-          create_event payload: payload
+          record_link = create_record_link_payload(
+            s[:system],
+            s[:type],
+            s[:external_id],
+            lookup_record.ext_system,
+            lookup_record.model_type,
+            lookup_record.external_id
+          )
+
+          emit(data, event, { record_link: record_link }) if boolify(options['emit_events'])
         end
 
         targets.each do |t|
-          payload = base_event.merge({
-            record_link: {
-              link_status: "200",
-              source_system: lookup_record.ext_system,
-              source_type: lookup_record.model_type,
-              source_id: lookup_record.uid,
-              target_system: t[:system],
-              target_type: t[:type],
-              target_id: t[:uid]
-            }
-          })
 
-          create_event payload: payload
+          record_link = create_record_link_payload(
+            lookup_record.ext_system,
+            lookup_record.model_type,
+            lookup_record.external_id,
+            t[:system],
+            t[:type],
+            t[:external_id]
+          )
+
+          emit(data, event, { record_link: record_link }) if boolify(options['emit_events'])
         end
 
       else
         # Return all the fetched record links
-        payload = base_event.merge({
-          record_link: {
-            link_status: '200',
-            system: lookup_record.ext_system,
-            type: lookup_record.model_type,
-            record_id: lookup_record.uid,
-            targets: targets,
-            sources: sources
-          }
-        })
-        create_event payload: payload
+        record_link = create_record_reference_payload(
+          lookup_record.ext_system,
+          lookup_record.model_type,
+          lookup_record.external_id,
+          sources,
+          targets
+        )
+
+        emit(data, event, { record_link: record_link }) if boolify(options['emit_events'])
       end
 
     end
@@ -651,23 +503,117 @@ module Agents
     def create_link(source_system, source_type, source_id, target_system, target_type, target_id)
       ActiveRecord::Base.transaction do
         # Ensure Source Record exists
-        source_record = HuginnRecordLinkAgent::ExternalRecordRef.find_or_create_by(
+        source_record = HuginnRecordLinkAgent::Record.find_or_create_by(
           user_id: user.id,
           ext_system: source_system,
           model_type: source_type,
-          uid: source_id
+          external_id: source_id
         )
 
         # Ensure Target Record exists
-        target_record = HuginnRecordLinkAgent::ExternalRecordRef.find_or_create_by(
+        target_record = HuginnRecordLinkAgent::Record.find_or_create_by(
           user_id: user.id,
           ext_system: target_system,
           model_type: target_type,
-          uid: target_id
+          external_id: target_id
         )
 
         return HuginnRecordLinkAgent::RecordLink.find_or_create_by(source_record_id: source_record.id, target_record_id: target_record.id)
       end
+    end
+
+    #---------------  UTILITY METHODS  ---------------#
+    def filter_links(links, filter_system, filter_type)
+      links = links.where(ext_system: filter_system) unless filter_system.blank?
+      links = links.where(model_type: filter_type) unless filter_type.blank?
+
+      return links
+    end
+
+    def create_record_link_payload(source_system, source_type, source_id, target_system, target_type, target_id)
+      return {
+        record_link: {
+          link_status: 200,
+          source_system: source_system,
+          source_type: source_type,
+          source_id: source_id,
+          target_system: target_system,
+          target_type: target_type,
+          target_id: target_id
+        }
+      }
+    end
+
+    def create_record_reference_payload(system, type, id, sources, targets)
+      return {
+        record_link: {
+          link_status: 200,
+          system: system,
+          type: type,
+          record_id: id,
+          sources: sources,
+          targets: targets
+        }
+      }
+    end
+
+    def create_lookup_error(system, type, id, filter_system, filter_type, message, error = nil)
+
+      error_payload = {
+        message: message,
+        system: system,
+        type: type,
+        id: id,
+        filter_system: filter_system,
+        filter_type: filter_type
+      }
+
+      if (error.present?)
+        error_payload = error_payload.merge({
+          error: error,
+          trace: error.backtrace.join("\n")
+        })
+      end
+
+      return error_payload
+    end
+
+    def create_link_error(source_system, source_type, source_id, target_system, target_type, target_id, error = nil)
+
+      error_payload = {
+        message: "Failed to create RecordLink: #{error.present? ? e.message : ''}",
+        source_system: source_system,
+        source_type: source_type,
+        source_id: source_id,
+        target_system: target_system,
+        target_type: target_type,
+        target_id: target_id
+      }
+
+      if (error.present?)
+        error_payload = error_payload.merge({
+          error: error,
+          trace: error.backtrace.join("\n")
+        })
+      end
+
+      return error_payload
+    end
+
+    def create_error_payload(status, error)
+      return {
+        record_link: {
+          link_status: status,
+          link_error: error
+        }
+      }
+    end
+
+    def emit(data, event, payload)
+      base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {}
+      payload = base_event.merge(payload)
+
+      create_event(payload: payload)
     end
 
   end
