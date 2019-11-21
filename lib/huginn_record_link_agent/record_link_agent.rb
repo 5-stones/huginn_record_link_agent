@@ -25,11 +25,18 @@ module Agents
         **Required Options:**
           - `source_system` - The source/authority for the record in question
           - `source_type` - The record type in the source system
-          - `source_id` - The record ID from the source system
+          - `source_id` - The record ID (or an array of IDs) from the source system
           - `target_system` - The system the source record is being sent to
           - `target_type` - The record type in the target system
-          - `target_id` - The record ID in the target system
+          - `target_id` - The record ID (or array of IDs) in the target system
           - `create_link` - Set to `true`
+
+        **Additional Notes:**
+        `target_id` and `source_id` can be set to an array in order to link multiple records together in a single execution.
+        In such cases, link creation will be wrapped in a transaction. The agent will only emit a successful event if all links
+        are created without error. If any of the links fail, a failure status will be emitted.
+
+        If _both_ `target_id` and `source_id` are arrays, then _all_ provided source records will be linked to _all_ provided targets
 
         ###Find Target Record Links
 
@@ -37,12 +44,17 @@ module Agents
 
           - `source_system` - The source/authority for the record in question
           - `source_type` - The record type in the source system
-          - `source_id` - The record ID from the source system
+          - `source_id` - The record ID(or array of IDs) from the source system
 
-        **Optional Filters:**
+        **Optional Filters/Settings:**
           - `target_system` - Only return matches from the specified system
           - `target_type` - Only return matches of the specified type (**Note:** When set, `target_system` is required)
           - `create_link` - Set to `false`. This value defaults to `false` if not provided
+          - `require_all` - If `true`, this Agent will only emit a successful event if a matching target is found for all provided source_id values
+
+        **Additional Notes:**
+        If `source_id` is an array and `require_all` is `true`, this Agent will ensure that at least one matching target exists for each
+        provided source. If any source is missing a target, then a 404 - Links Missing event will be emitted.
 
         ###Find Source Record Links
 
@@ -50,12 +62,17 @@ module Agents
 
           - `target_system` - The system the record was sent to
           - `target_type` - The record type in the target system
-          - `target_id` - The record ID from the target system
+          - `target_id` - The record ID (or array of IDs) from the target system
 
-        **Optional Filters
+        **Optional Filters/Options:**
           - `source_system` - Only return matches from the specified system
           - `source_type` - Only return matches of the specified type (**Note:** When set, `target_system` is required)
           - `create_link` - Set to `false`. This value defaults to `false` if not provided
+          - `require_all` - If `true`, this Agent will only emit a successful event if a matching source is found for all provided target_id values
+
+        **Additional Notes:**
+        If `target_id` is an array and `require_all` is `true`, this Agent will ensure that at least one matching source exists for each
+        provided target. If any source is missing a target, then a 404 - Links Missing event will be emitted.
 
         ###Find All Record Links
 
@@ -71,6 +88,29 @@ module Agents
           - `system_filter` - Only return links to or from the specified system
           - `type_filter` - Only return links to or from the specified type
 
+        ###Hard Errors vs Soft Errors
+        This agent issues two distinct error statuses: `404` and `500`.
+
+        A `404` is treated like a soft error. These errors will be reported for
+        debugging purposes, but they will not result in a task failure unless the
+        `require_all` parameter is set to true.
+
+        If `emit_each` is set to `true`, and `emit_events` is `true`, soft errors
+        will be emitted individually with a `link_status` of `404`. If `emit_each`
+        is false, a single error will be emitted with a `link_status` of `404` and
+        an array of each individua error.
+
+        A `500` status is considered a critical failure and is only issued when
+        unexpected errors are encountered during processing (usually related to
+        database interactions) If a critical error is encountered, this will always
+        result in a task failure.
+
+        When a 500 error occurs, if `emit_events` is `true`, then all errors
+        encountered during processing will be consolidated in to a single `link_error`
+        payload with a `link_status` of `500`.
+
+        **NOTE:** If `emit_each` is `true`, the option
+        is ignored when a 500 error occurs.
 
         ### Recommended Usage
 
@@ -87,6 +127,10 @@ module Agents
         In the case of an integration between an eCommerce platform and an external product
         catalog, the product catalog would be considered the `source` for product and category
         information as it is likely the authority on all product/category information.
+
+        **Regarding require_all:**
+        When looking up source or target records, if `require_all` is set to `true`, it is recommended that `emit_each` be omitted
+        (or explicitly set to `false`) so that further operations can be performed on the entire batch of matched records.
       MD
     end
 
@@ -108,6 +152,7 @@ module Agents
 
       When `emit_each` is set to `false`, events look like this:
 
+      ```
         {
           "record_link": {
             "link_status": "200",
@@ -142,6 +187,7 @@ module Agents
           }
         }
 
+      ```
       Original event contents will be merged when `output_mode` is set to `merge`.
     MD
 
@@ -331,18 +377,26 @@ module Agents
       target_id = data['target_id']
 
       log("Creating RecordLink from #{source_system} #{source_type} #{source_id} to #{target_system} #{target_type} #{target_id}")
+      results = HuginnRecordLinkAgent::RecordLinkBuilder.create_links(user, source_system, source_type, source_id, target_system, target_type, target_id)
 
-      begin
-        record_link = create_link(source_system, source_type, source_id, target_system, target_type, target_id)
+      if results[:link_status] == 200
+        if boolify(options['emit_each']) || results[:links].length == 1
+          results[:links].each do |record_link|
+            payload = { link_status: results[:link_status] }.merge(record_link)
+            emit(data, event, payload) if boolify(options['emit_events'])
+          end
+        else
+          # :results will be a hash object with :link_status and :links keys
+          payload = results
+          emit(data, event, payload) if boolify(options['emit_events'])
+        end
 
-        payload = create_record_link_payload(source_system, source_type, source_id, target_system, target_type, target_id)
-        emit(data, event, payload) if boolify(options['emit_events'])
-
-      rescue => e
-        link_error = create_link_error(source_system, source_type, source_id, target_system, target_type, target_id, "Failed to create RecordLink: #{e.message}")
-        payload = create_error_payload(500, link_error)
+      else
+        # :results will be a hash object with :link_status and :error_detail keys
+        payload = results
         emit(data, event, payload) if boolify(options['emit_events'])
       end
+
     end
 
     def find_source_links(event, data)
@@ -355,22 +409,13 @@ module Agents
       source_system = data['source_system']
       source_type = data['source_type']
 
-      record = get_record_reference(target_system, target_type, target_id)
+      # Ensure we have an array for iteration purposes
+      lookup_ids = target_id.respond_to?('each') ? target_id : [target_id]
+      results = HuginnRecordLinkAgent::RecordLinkLookupTool.lookup_records(user, target_system, target_type, lookup_ids, source_system, source_type, 'source')
 
-      if (record.nil?)
-        lookup_error = create_lookup_error(target_system, target_type, target_id, source_system, source_type, "Unable to locate lookup record")
-        payload = create_error_payload(500, lookup_error)
+      payloads = HuginnRecordLinkAgent::RecordLinkPayloadBuilder.build_payloads(results, boolify(options['emit_each']), boolify(options['require_all']))
+      payloads.each do |payload|
         emit(data, event, payload) if boolify(options['emit_events'])
-      else
-        source_records = filter_links(record.source_records, source_system, source_type)
-
-        if source_records.any?
-          build_events(event, data, record, source_records) if boolify(options['emit_events'])
-        else
-          lookup_error = create_lookup_error(target_system, target_type, target_id, souce_system, source_type, "No matching sources found")
-          payload = create_error_payload(404, lookup_error)
-          emmit(data, event, payload) if boolify(options['emit_events'])
-        end
       end
     end
 
@@ -379,27 +424,19 @@ module Agents
       source_system = data['source_system']
       source_type = data['source_type']
       source_id = data['source_id']
-
       # Optional Filters
       target_system = data['target_system']
       target_type = data['target_type']
 
-      record = get_record_reference(source_system, source_type, source_id)
+      # Ensure we have an array for iteration purposes
+      lookup_ids = source_id.respond_to?('each') ? source_id : [source_id]
+      results = HuginnRecordLinkAgent::RecordLinkLookupTool.lookup_records(user, source_system, source_type, lookup_ids, target_system, target_type, 'target')
+      log(results.inspect)
 
-      if (record.nil?)
-        lookup_error = create_lookup_error(source_system, source_type, source_id, target_system, target_type, "Unable to locate lookup record")
-        payload = create_error_payload(500, lookup_error)
+      payloads = HuginnRecordLinkAgent::RecordLinkPayloadBuilder.build_payloads(results, boolify(options['emit_each']), boolify(options['require_all']))
+      log(payloads.inspect)
+      payloads.each do |payload|
         emit(data, event, payload) if boolify(options['emit_events'])
-      else
-        target_records = filter_links(record.target_records, target_system, target_type)
-
-        if target_records.any?
-          build_events(event, data, record, nil, target_records) if boolify(options['emit_events'])
-        else
-          lookup_error = create_lookup_error(source_system, source_type, source_id, target_system, target_type, "No matching targets found")
-          payload = create_error_payload(404, lookup_error)
-          emit(data, event, payload) if boolify(options['emit_events'])
-        end
       end
     end
 
@@ -413,203 +450,26 @@ module Agents
       filter_system = data['filter_system']
       filter_type = data['filter_type']
 
-      record = get_record_reference(record_system, record_type, record_id)
+      # Ensure we have an array for iteration purposes
+      lookup_ids = record_id.respond_to?('each') ? lookup_id : [lookup_id]
+      results = HuginnRecordLinkAgent::RecordLinkLookupTool.lookup_records(user, record_system, record_type, record_ids, filter_system, filter_type)
 
-      if (record.nil?)
-        lookup_error = create_lookup_error(record_system, record_type, record_id, filter_system, filter_type, "Unable to find lookup record")
-        payload = create_error_payload(500, lookup_error)
+      payloads = HuginnRecordLinkAgent::RecordLinkPayloadBuilder.build_payloads(results, boolify(options['emit_each']), boolify(options['require_all']))
+      payloads.each do |payload|
         emit(data, event, payload) if boolify(options['emit_events'])
-      else
-        source_records = filter_links(record.source_records, filter_system, filter_type)
-        target_records = filter_links(record.target_records, filter_system, filter_type)
-
-        if source_records.any? || target_records.any?
-          build_events(event, data, record, source_records, target_records) if boolify(options['emit_events'])
-        else
-          lookup_error = create_lookup_error(record_system, record_type, record_id, filter_system, filter_type, "No matching links found")
-          payload = create_error_payload(404, lookup_error)
-          emit(data, event_payload) if boolify(options['emit_events'])
-        end
       end
     end
 
-    def get_record_reference(system, type, id)
-      return HuginnRecordLinkAgent::Record.find_or_create_by(user_id: self.user.id, ext_system: system, model_type: type, external_id: id)
-    end
-
-    def build_events(event, data, lookup_record, source_records = nil, target_records = nil)
-      sources = []
-      if (source_records.present?)
-        source_records.each do |s|
-          sources << { system: s.ext_system, type: s.model_type, external_id: s.external_id }
-        end
-      end
-
-      targets = []
-      if (target_records.present?)
-        target_records.each do |t|
-          targets << { system: t.ext_system, type: t.model_type, external_id: t.external_id }
-        end
-      end
-
-      base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {}
-
-      if boolify(options['emit_each'])
-        # Emit each event individually
-
-        sources.each do |s|
-
-          record_link = create_record_link_payload(
-            s[:system],
-            s[:type],
-            s[:external_id],
-            lookup_record.ext_system,
-            lookup_record.model_type,
-            lookup_record.external_id
-          )
-
-          emit(data, event, { record_link: record_link }) if boolify(options['emit_events'])
-        end
-
-        targets.each do |t|
-
-          record_link = create_record_link_payload(
-            lookup_record.ext_system,
-            lookup_record.model_type,
-            lookup_record.external_id,
-            t[:system],
-            t[:type],
-            t[:external_id]
-          )
-
-          emit(data, event, { record_link: record_link }) if boolify(options['emit_events'])
-        end
-
-      else
-        # Return all the fetched record links
-        record_link = create_record_reference_payload(
-          lookup_record.ext_system,
-          lookup_record.model_type,
-          lookup_record.external_id,
-          sources,
-          targets
-        )
-
-        emit(data, event, { record_link: record_link }) if boolify(options['emit_events'])
-      end
-
-    end
-
-    def create_link(source_system, source_type, source_id, target_system, target_type, target_id)
-      ActiveRecord::Base.transaction do
-        # Ensure Source Record exists
-        source_record = HuginnRecordLinkAgent::Record.find_or_create_by(
-          user_id: user.id,
-          ext_system: source_system,
-          model_type: source_type,
-          external_id: source_id
-        )
-
-        # Ensure Target Record exists
-        target_record = HuginnRecordLinkAgent::Record.find_or_create_by(
-          user_id: user.id,
-          ext_system: target_system,
-          model_type: target_type,
-          external_id: target_id
-        )
-
-        return HuginnRecordLinkAgent::RecordLink.find_or_create_by(source_record_id: source_record.id, target_record_id: target_record.id)
-      end
-    end
 
     #---------------  UTILITY METHODS  ---------------#
-    def filter_links(links, filter_system, filter_type)
-      links = links.where(ext_system: filter_system) unless filter_system.blank?
-      links = links.where(model_type: filter_type) unless filter_type.blank?
-
-      return links
-    end
-
-    def create_record_link_payload(source_system, source_type, source_id, target_system, target_type, target_id)
-      return {
-        record_link: {
-          link_status: 200,
-          source_system: source_system,
-          source_type: source_type,
-          source_id: source_id,
-          target_system: target_system,
-          target_type: target_type,
-          target_id: target_id
-        }
-      }
-    end
-
-    def create_record_reference_payload(system, type, id, sources, targets)
-      return {
-        record_link: {
-          link_status: 200,
-          system: system,
-          type: type,
-          record_id: id,
-          sources: sources,
-          targets: targets
-        }
-      }
-    end
-
-    def create_lookup_error(system, type, id, filter_system, filter_type, message, error = nil)
-
-      error_payload = {
-        message: message,
-        system: system,
-        type: type,
-        id: id,
-        filter_system: filter_system,
-        filter_type: filter_type
-      }
-
-      if (error.present?)
-        error_payload = error_payload.merge({
-          error: error,
-          trace: error.backtrace.join("\n")
-        })
-      end
-
-      return error_payload
-    end
-
-    def create_link_error(source_system, source_type, source_id, target_system, target_type, target_id, error = nil)
-
-      error_payload = {
-        message: "Failed to create RecordLink: #{error.present? ? e.message : ''}",
-        source_system: source_system,
-        source_type: source_type,
-        source_id: source_id,
-        target_system: target_system,
-        target_type: target_type,
-        target_id: target_id
-      }
-
-      if (error.present?)
-        error_payload = error_payload.merge({
-          error: error,
-          trace: error.backtrace.join("\n")
-        })
-      end
-
-      return error_payload
-    end
-
-    def create_error_payload(status, error)
-      return {
-        record_link: {
-          link_status: status,
-          link_error: error
-        }
-      }
-    end
-
     def emit(data, event, payload)
+
+      if (payload[:link_status] == 200)
+        payload = { record_link: payload }
+      else
+        payload = { link_error: payload }
+      end
+
       base_event = data['output_mode'].to_s == 'merge' ? event.payload.dup : {}
       payload = base_event.merge(payload)
 
