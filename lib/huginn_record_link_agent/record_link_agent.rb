@@ -349,6 +349,8 @@ module Agents
     def receive(incoming_events)
       incoming_events.each do |event|
 
+        log({killer_event_id: event.id, need: "bourbon"})
+
         data = interpolated(event)
 
         if boolify(data['create_link'])
