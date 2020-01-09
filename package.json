@@ -1,6 +1,6 @@
 {
   "name": "huginn_record_link_agent",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Huginn agent for creating bidirectional link between records across external systems",
   "scripts": {
     "version": "npm run changelog && git add CHANGELOG.md && npm run version:gemspec",
