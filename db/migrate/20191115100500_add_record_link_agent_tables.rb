@@ -9,7 +9,7 @@ class AddRecordLinkAgentTables < ActiveRecord::Migration[4.2]
       t.string :external_id, null: false
       t.timestamps null: false
 
-      t.index [:user_id, :system, :model_type, :external_id], unique: true, name: 'record_constraint'
+      t.index [:user_id, :ext_system, :model_type, :external_id], unique: true, name: 'record_constraint'
     end
 
     create_table :hrla_record_links do |t|
