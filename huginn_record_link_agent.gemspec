@@ -4,7 +4,7 @@ $LOAD_PATH.unshift(lib) unless $LOAD_PATH.include?(lib)
 
 Gem::Specification.new do |spec|
   spec.name          = "huginn_record_link_agent"
-  spec.version       = "1.1.1"
+  spec.version       = "1.1.1-autoload"
   spec.authors       = ["Mike Rogers"]
   spec.email         = ["mrogers@weare5stones.com"]
 

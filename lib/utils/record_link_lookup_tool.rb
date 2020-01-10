@@ -1,3 +1,6 @@
+require_relative '../models/record_link'
+require_relative '../models/record'
+
 class HuginnRecordLinkAgent::RecordLinkLookupTool
 
   # This is a utility class for managing the lookup of RecordLink instances.

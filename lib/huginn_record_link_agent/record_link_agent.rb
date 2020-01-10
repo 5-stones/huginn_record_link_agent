@@ -1,3 +1,10 @@
+
+require_relative '../models/record_link'
+require_relative '../models/record'
+require_relative '../utils/record_link_builder'
+require_relative '../utils/record_link_lookup_tool'
+require_relative '../utils/record_link_payload_builder'
+
 module Agents
   class RecordLinkAgent < Agent
 
